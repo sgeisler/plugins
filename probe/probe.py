@@ -105,13 +105,16 @@ def start_probe(plugin):
 def choose_target(plugin: Plugin):
     while True:
         s: Session = plugin.Session()
-        node: Optional[Target] = s.query(Target)\
+        pot_nodes = s.query(Target)\
             .order_by(Target.id)\
             .filter(Target.final == False)\
-            .first()
+            .limit(10)\
+            .all()
 
-        if not node:
+        if not pot_nodes:
             return None
+
+        node = random.choice(pot_nodes)
 
         p = Probe(destination=node.id, started_at=datetime.now())
         s.add(p)
@@ -167,51 +170,6 @@ def probe(plugin: Plugin, req=None):
         p.error = json.dumps(error, cls=SatsEncoder)
         s.commit()
         pass
-
-
-@plugin.method('traceroute')
-def traceroute(plugin, node_id, **kwargs):
-    traceroute = {
-        'destination': node_id,
-        'started_at': str(datetime.now()),
-        'probes': [],
-    }
-    try:
-        traceroute['route'] = plugin.rpc.getroute(
-            traceroute['destination'],
-            msatoshi=10000,
-            riskfactor=1,
-        )['route']
-        traceroute['payment_hash'] = ''.join(random.choice(string.hexdigits) for _ in range(64))
-    except RpcError:
-        traceroute['failcode'] = -1
-        return traceroute
-
-    # For each prefix length, shorten the route and attempt the payment
-    for l in range(1, len(traceroute['route'])+1):
-        probe = {
-            'route': traceroute['route'][:l],
-            'payment_hash': ''.join(random.choice(string.hexdigits) for _ in range(64)),
-            'started_at': str(datetime.now()),
-        }
-        probe['destination'] = probe['route'][-1]['id']
-        plugin.rpc.sendpay(probe['route'], probe['payment_hash'])
-
-        try:
-            plugin.rpc.waitsendpay(probe['payment_hash'], timeout=30)
-            raise ValueError("The recipient guessed the preimage? Cryptography is broken!!!")
-        except RpcError as e:
-            probe['finished_at'] = str(datetime.now())
-            if e.error['code'] == 200:
-                probe['error'] = "Timeout"
-                break
-            else:
-                probe['error'] = e.error['data']
-                probe['failcode'] = e.error['data']['failcode']
-
-        traceroute['probes'].append(probe)
-
-    return traceroute
 
 
 @plugin.method('probe-stats')
@@ -286,6 +244,7 @@ def clear_temporary_exclusion(plugin):
 
 
 def schedule(plugin):
+    sleep(30)
     # List of scheduled calls with next runtime, function and interval
     next_runs = [
         (time() + 300, clear_temporary_exclusion, 300),
@@ -318,7 +277,7 @@ def init(configuration, options, plugin):
         'probes-{}.db'.format(PROBE_AMOUNT_SATS)
     )
 
-    engine = create_engine(db_filename, echo=True)
+    engine = create_engine(db_filename)
     Base.metadata.create_all(engine)
     plugin.Session = sessionmaker()
     plugin.Session.configure(bind=engine)
