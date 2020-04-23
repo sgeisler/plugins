@@ -34,12 +34,14 @@ Failcode -1 and 16399 are special:
 
 """
 from datetime import datetime
+from typing import Optional
+
 from pyln.client import Plugin, RpcError
 from random import choice
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from time import sleep, time
 import heapq
 import json
@@ -48,6 +50,8 @@ import random
 import string
 import threading
 
+MAX_PROBES_PER_TARGET = 20
+PROBE_AMOUNT_SATS = 1000
 
 Base = declarative_base()
 plugin = Plugin()
@@ -55,11 +59,17 @@ plugin = Plugin()
 exclusions = []
 temporary_exclusions = {}
 
+class SatsEncoder(json.JSONEncoder):
+    def default(self, o):
+        if o.__class__.__name__ == "Millisatoshi":
+            return str(o)
+        else:
+            return o
 
 class Probe(Base):
     __tablename__ = "probes"
     id = Column(Integer, primary_key=True)
-    destination = Column(String)
+    destination = Column(String, ForeignKey('targets.id'))
     route = Column(String)
     error = Column(String)
     erring_channel = Column(String)
@@ -79,46 +89,84 @@ class Probe(Base):
             'finished_at': str(self.finished_at),
         }
 
+class Target(Base):
+    __tablename__ = "targets"
+    id = Column(String, primary_key=True)
+    final = Column(Boolean)
+    probes = relationship("Probe")
+
+
 def start_probe(plugin):
     t = threading.Thread(target=probe, args=[plugin, None])
     t.daemon = True
     t.start()
 
 
-@plugin.async_method('probe')
-def probe(plugin, request, node_id=None, **kwargs):
-    res = None
-    if node_id is None:
-        nodes = plugin.rpc.listnodes()['nodes']
-        node_id = choice(nodes)['nodeid']
+def choose_target(plugin: Plugin):
+    while True:
+        s: Session = plugin.Session()
+        node: Optional[Target] = s.query(Target)\
+            .order_by(Target.id)\
+            .filter(Target.final == False)\
+            .first()
 
-    s = plugin.Session()
-    p = Probe(destination=node_id, started_at=datetime.now())
-    s.add(p)
+        if not node:
+            return None
+
+        p = Probe(destination=node.id, started_at=datetime.now())
+        s.add(p)
+        try:
+            route = plugin.rpc.getroute(
+                node.id,
+                msatoshi=PROBE_AMOUNT_SATS * 1000,
+                riskfactor=1,
+                exclude=exclusions + list(temporary_exclusions.keys())
+            )['route']
+            p.route = ','.join([r['channel'] for r in route])
+            p.payment_hash = ''.join(choice(string.hexdigits) for _ in range(64))
+
+            if len(node.probes) > MAX_PROBES_PER_TARGET:
+                node.final = True
+
+            s.commit()
+            return (route, p)
+        except RpcError:
+            p.failcode = -1
+            node.final = True
+            s.commit()
+
+
+def probe(plugin: Plugin, req=None):
+    res = choose_target(plugin)
+
+    if not res:
+        print("Finished probing with {} sat".format(PROBE_AMOUNT_SATS))
+        exit(0)
+
+    r, p = res
+
+    print("Probing {}".format(p.destination))
+
     try:
-        route = plugin.rpc.getroute(
-            node_id,
-            msatoshi=10000,
-            riskfactor=1,
-            exclude=exclusions + list(temporary_exclusions.keys())
-        )['route']
-        p.route = ','.join([r['channel'] for r in route])
-        p.payment_hash = ''.join(choice(string.hexdigits) for _ in range(64))
-    except RpcError:
-        p.failcode = -1
-        res = p.jsdict()
-        s.commit()
-        return request.set_result(res) if request else None
+        plugin.rpc.sendpay(r, p.payment_hash)
+        plugin.pending_probes.append({
+            'request': req,
+            'probe_id': p.id,
+            'payment_hash': p.payment_hash,
+            'callback': complete_probe,
+            'plugin': plugin,
+        })
+    except RpcError as e:
+        print(e)
 
-    s.commit()
-    plugin.rpc.sendpay(route, p.payment_hash)
-    plugin.pending_probes.append({
-        'request': request,
-        'probe_id': p.id,
-        'payment_hash': p.payment_hash,
-        'callback': complete_probe,
-        'plugin': plugin,
-    })
+        s: Session = plugin.Session()
+        p = s.query(Probe).get(p.id)
+        error = e.error['data']
+        p.erring_channel = e.error['data']['erring_channel']
+        p.failcode = e.error['data']['failcode']
+        p.error = json.dumps(error, cls=SatsEncoder)
+        s.commit()
+        pass
 
 
 @plugin.method('traceroute')
@@ -176,7 +224,7 @@ def stats(plugin):
 
 
 def complete_probe(plugin, request, probe_id, payment_hash):
-    s = plugin.Session()
+    s: Session = plugin.Session()
     p = s.query(Probe).get(probe_id)
     try:
         plugin.rpc.waitsendpay(p.payment_hash)
@@ -184,7 +232,7 @@ def complete_probe(plugin, request, probe_id, payment_hash):
         error = e.error['data']
         p.erring_channel = e.error['data']['erring_channel']
         p.failcode = e.error['data']['failcode']
-        p.error = json.dumps(error)
+        p.error = json.dumps(error, cls=SatsEncoder)
 
     if p.failcode in [16392, 16394]:
         exclusion = "{erring_channel}/{erring_direction}".format(**error)
@@ -201,11 +249,16 @@ def complete_probe(plugin, request, probe_id, payment_hash):
         expiry = time() + plugin.probe_exclusion_duration
         temporary_exclusions[exclusion] = expiry
 
+    if p.failcode == 16399:
+        t = s.query(Target).get(p.destination)
+        t.final = True
+
     p.finished_at = datetime.now()
     res = p.jsdict()
     s.commit()
     s.close()
-    request.set_result(res)
+    if request:
+        request.set_result(res)
 
 
 def poll_payments(plugin):
@@ -213,6 +266,7 @@ def poll_payments(plugin):
     """
     for probe in plugin.pending_probes:
         p = plugin.rpc.listsendpays(None, payment_hash=probe['payment_hash'])
+        print(p)
         if p['payments'][0]['status'] == 'pending':
             continue
 
@@ -254,18 +308,30 @@ def schedule(plugin):
 
 @plugin.init()
 def init(configuration, options, plugin):
+    print("Starting probe plugin with {} sats".format(PROBE_AMOUNT_SATS))
+
     plugin.probe_interval = int(options['probe-interval'])
     plugin.probe_exclusion_duration = int(options['probe-exclusion-duration'])
 
     db_filename = 'sqlite:///' + os.path.join(
         configuration['lightning-dir'],
-        'probes.db'
+        'probes-{}.db'.format(PROBE_AMOUNT_SATS)
     )
 
     engine = create_engine(db_filename, echo=True)
     Base.metadata.create_all(engine)
     plugin.Session = sessionmaker()
     plugin.Session.configure(bind=engine)
+
+    # Take snapshots of peers online we are interested in
+    nodes = plugin.rpc.listnodes()['nodes']
+    sess: Session = plugin.Session()
+    if sess.query(Target).count() == 0:
+        print("Will probe {} node".format(len(nodes)))
+        for node in nodes:
+            sess.add(Target(id=node['nodeid'], final=False))
+        sess.commit()
+
     t = threading.Thread(target=schedule, args=[plugin])
     t.daemon = True
     t.start()
